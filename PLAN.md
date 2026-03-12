@@ -680,10 +680,18 @@ interface PaymentSettings {
   upiId?: string
   cardEnabled: boolean
   razorpayEnabled: boolean
-  razorpayKeyId?: string
-  razorpayKeySecret?: string            // never exposed to client bundle
   codEnabled: boolean
   codMinimumOrder?: number
+  // Razorpay credentials are stored encrypted in settings/integrationKeys — not here
+}
+
+// settings/integrationKeys  (AES-256-GCM encrypted at rest; never returned raw via API)
+interface IntegrationKeys {
+  razorpayKeyId?: string
+  razorpayKeySecret?: string            // encrypted
+  razorpayWebhookSecret?: string        // encrypted
+  resendApiKey?: string                 // encrypted
+  smtpPassword?: string                 // encrypted (selfhosted email)
 }
 
 // settings/policies
@@ -1234,7 +1242,8 @@ Filters the in-memory product array using JS `includes()` on name + sku + barcod
 /[locale]/admin/reports/refunds               Refund audit log
 /[locale]/admin/settings                      Settings index (owner only)
 /[locale]/admin/settings/shop                 Shop info, hours, contact
-/[locale]/admin/settings/payment              Payment methods + Razorpay config
+/[locale]/admin/settings/payment              Payment methods (enable/disable; no raw keys here)
+/[locale]/admin/settings/integrations         Encrypted credentials — Razorpay keys, Resend API key, SMTP password; show/hide toggle; "Saved" badges; owner only
 /[locale]/admin/settings/policies             Refund window + policy text
 /[locale]/admin/settings/notifications        Per-staff alert preferences
 /[locale]/admin/settings/staff                Staff account management
@@ -1314,6 +1323,8 @@ src/
     adapters.ts                         // profile factory
     theme.ts                            // loadThemeTokens() → CSS string
     constants.ts
+    encryption.ts                       // server-only AES-256-GCM encrypt/decrypt; requires ENCRYPTION_KEY env var (64 hex chars); maskKey() + isEncrypted() helpers
+    integration-keys.ts                 // server-only resolver — reads Razorpay + Resend + SMTP keys from settings/integrationKeys (decrypted), falls back to env vars; process-cached 60 s; call invalidateIntegrationKeysCache() after admin writes
     repositories/
       products.ts                       // exports PRODUCT_SIEVE_FIELDS; create/update/delete also call search.index / search.delete
       orders.ts                         // exports ORDER_SIEVE_FIELDS
@@ -1379,9 +1390,10 @@ src/
       ImageUploader.tsx · RichTextEditor.tsx
       ColorPicker.tsx                   // for theme editor
     layout/
-      Header.tsx · Footer.tsx · AdminSidebar.tsx
+      Header.tsx · Footer.tsx · AdminSidebar.tsx  // AdminSidebar: Integrations link (KeyRound icon) under Settings group
       ThemeSwitcher.tsx                 // floating storefront widget
-      SearchBox.tsx                     // header instant-search input + suggestion dropdown
+      SearchBox.tsx                     // header search input (desktop inline + mobile inline)
+      SearchDialog.tsx                  // spotlight-style Cmd+K / Ctrl+K search dialog; debounced 250 ms; product/category results with images; keyboard-navigable; "see all results" link
     storefront/
       ProductCard.tsx · ProductGallery.tsx
       CategoryGrid.tsx · InquiryForm.tsx · CartDrawer.tsx
@@ -1397,10 +1409,10 @@ src/
     useProductTranslation.ts
     useTheme.ts                         // dark/light client toggle
     useUrlTable.ts                      // filter/sort/page as SieveJS DSL in URL (?filters=&sorts=&page=&pageSize=)
-    useSearch.ts                        // debounced instant suggestions (250 ms), navigate on Enter
+    useSearch.ts                        // debounced instant suggestions (250 ms), navigate on Enter; consumed by both SearchBox and SearchDialog
   constants/
-    routes.ts
-    collections.ts
+    routes.ts                           // includes ADMIN_SETTINGS_INTEGRATIONS = '/admin/settings/integrations'
+    collections.ts                      // includes INTEGRATION_KEYS = 'integrationKeys'
     themes.ts                           // preset ThemeTokens objects (exported as named typed consts)
     categories.ts                       // seeded category tree
   types/
@@ -1442,8 +1454,11 @@ src/
 | `PATCH` | `/api/settings/theme` | owner | Update theme |
 | `GET` | `/api/settings/shop` | — | Public shop info |
 | `PATCH` | `/api/settings/shop` | owner | Update |
-| `PATCH` | `/api/settings/payment` | owner | Update |
+| `PATCH` | `/api/settings/payment` | owner | Update payment toggles |
 | `PATCH` | `/api/settings/policies` | admin+ | Update |
+| `GET` | `/api/admin/settings/integration-keys` | owner | Returns masked values (`••••••`) and `IsSet` booleans — never raw secrets |
+| `PATCH` | `/api/admin/settings/integration-keys` | owner | Encrypts and saves fields to `settings/integrationKeys` |
+| `DELETE` | `/api/admin/settings/integration-keys?field=<name>` | owner | Removes a single key field |
 | `GET` | `/api/auth/otp/send` | — | Send phone OTP |
 | `POST` | `/api/auth/otp/verify` | — | Verify OTP → token |
 | `GET` | `/api/search` | — | Full-text search (`?q=&category=&sort=&page=&inStock=`) |
@@ -1829,7 +1844,10 @@ NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=
 RESEND_API_KEY=
 RESEND_FROM_ADDRESS=noreply@newcitytronics.com
 
-# Razorpay (optional)
+# Encryption (required when using DB-stored integration keys)
+ENCRYPTION_KEY=                     # 64 hex chars (32-byte AES-256 key) — generate with: openssl rand -hex 32
+
+# Razorpay (optional — env vars are fallback; prefer storing via Settings → Integrations)
 RAZORPAY_KEY_ID=
 RAZORPAY_KEY_SECRET=
 RAZORPAY_WEBHOOK_SECRET=
